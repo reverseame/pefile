@@ -2933,6 +2933,26 @@ class PE(object):
         return entries
 
 
+    def __debug_data_offset(self, dbg):
+        """Offset in __data__ of the data of a debug directory entry, or None if it is not there.
+
+        In a virtual layout (memory image) PointerToRawData is a file offset that may fall outside
+        every section when the debug data is not mapped; then fall back to AddressOfRawData, the RVA
+        where the loader mapped it (0 if not mapped).
+        """
+        if not self.__virtual_layout:
+            return dbg.PointerToRawData
+        offset = self.get_rva_from_offset(dbg.PointerToRawData)
+        if offset is None:
+            offset = dbg.AddressOfRawData or None
+        return offset
+
+    def __debug_data(self, offset, size):
+        if offset is None:
+            return b''
+        return self.__data__[offset:offset+size]
+
+
     def parse_debug_directory(self, rva, size):
         """"""
 
@@ -2966,12 +2986,9 @@ class PE(object):
 
             elif dbg.Type == 2:
                 # if IMAGE_DEBUG_TYPE_CODEVIEW
-                if self.__virtual_layout:
-                    dbg_type_offset = self.get_rva_from_offset(dbg.PointerToRawData)
-                else:
-                    dbg_type_offset = dbg.PointerToRawData
+                dbg_type_offset = self.__debug_data_offset(dbg)
                 dbg_type_size = dbg.SizeOfData
-                dbg_type_data = self.__data__[dbg_type_offset:dbg_type_offset+dbg_type_size]
+                dbg_type_data = self.__debug_data(dbg_type_offset, dbg_type_size)
 
                 if dbg_type_data[:4] == b'RSDS':
                     # pdb7.0
@@ -3024,12 +3041,9 @@ class PE(object):
 
             elif dbg.Type == 4:
                 # IMAGE_DEBUG_TYPE_MISC
-                if self.__virtual_layout:
-                    dbg_type_offset = self.get_rva_from_offset(dbg.PointerToRawData)
-                else:
-                    dbg_type_offset = dbg.PointerToRawData
+                dbg_type_offset = self.__debug_data_offset(dbg)
                 dbg_type_size = dbg.SizeOfData
-                dbg_type_data = self.__data__[dbg_type_offset:dbg_type_offset+dbg_type_size]
+                dbg_type_data = self.__debug_data(dbg_type_offset, dbg_type_size)
                 ___IMAGE_DEBUG_MISC_format__ = ['IMAGE_DEBUG_MISC',
                     ['I,DataType',
                      'I,Length',
@@ -4086,7 +4100,9 @@ class PE(object):
             runtime_function = self.__unpack_data__(self.__IMAGE_RUNTIME_FUNCTION_ENTRY_format__, 
                                 self.__data__[index:index+runtime_function_size],
                                 file_offset = index)
-            
+            # Truncated entry (e.g. end of a memory image): stop, as with the all-zeroes terminator.
+            if runtime_function is None:
+                break
             runtime_function_list.append(runtime_function)
             if runtime_function.all_zeroes():
                 break
@@ -4097,11 +4113,16 @@ class PE(object):
         return runtime_function_list
 
     def parse_unwind_info(self, pointer):
-        '''https://docs.microsoft.com/en-gb/cpp/build/exception-handling-x64?view=vs-2019#struct-unwind_info'''
+        '''https://docs.microsoft.com/en-gb/cpp/build/exception-handling-x64?view=vs-2019#struct-unwind_info
+
+        Returns None if the UNWIND_INFO cannot be read (pointer outside the data or truncated, as
+        happens with chained entries pointing to non-resident pages of a memory image).'''
 
         unwind_size = Structure(self.__UNWIND_INFO_format_1__).sizeof()
         
         unwind = self.__unpack_data__(self.__UNWIND_INFO_format_1__, self.__data__[pointer: pointer + unwind_size], pointer)
+        if unwind is None:
+            return None
 
         unwind.Version = unwind.Version_Flags & 0x7
         unwind.Flags = (unwind.Version_Flags & 0xF8) >> 3
@@ -4128,7 +4149,8 @@ class PE(object):
                                 file_offset = code_end_pointer)
 
             #unwind.chained_unwind_info = self.__unpack_data__(self.__IMAGE_RUNTIME_FUNCTION_ENTRY_format__, self.__data__[code_end_pointer: code_end_pointer + unwind_size], code_end_pointer)
-            unwind.chained_unwind_info.UnwindInfoStruct = self.parse_unwind_info(unwind.chained_unwind_info.UnwindInformation)
+            if unwind.chained_unwind_info is not None:
+                unwind.chained_unwind_info.UnwindInfoStruct = self.parse_unwind_info(unwind.chained_unwind_info.UnwindInformation)
         
         
         return unwind
